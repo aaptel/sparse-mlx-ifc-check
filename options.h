@@ -69,7 +69,8 @@ extern int dbg_postorder;
 
 extern int dump_macro_defs;
 extern int dump_macros_only;
-
+extern const char *dump_ifc_size_out;
+extern int dump_ifc;
 extern int dissect_show_all_symbols;
 
 extern unsigned long fdump_ir;

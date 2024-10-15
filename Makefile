@@ -104,6 +104,7 @@ PROGRAMS += test-linearize
 PROGRAMS += test-parsing
 PROGRAMS += test-show-type
 PROGRAMS += test-unssa
+PROGRAMS += mlx_check
 
 INST_PROGRAMS=sparse cgcc
 INST_MAN1=sparse.1 cgcc.1

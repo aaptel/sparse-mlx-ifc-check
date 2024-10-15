@@ -69,7 +69,8 @@ int dbg_postorder = 0;
 
 int dump_macro_defs = 0;
 int dump_macros_only = 0;
-
+const char *dump_ifc_size_out = NULL;
+int dump_ifc = 0;
 int dissect_show_all_symbols = 0;
 
 unsigned long fdump_ir;
@@ -995,6 +996,22 @@ static char **handle_version(char *arg, char **next)
 	exit(0);
 }
 
+static char **handle_dump_ifc_size(char *arg, char **next)
+{
+	if (*arg++ != '=')
+		die("missing argument for --dump-ifc-size");
+
+	dump_ifc_size_out = arg;
+
+	return next;
+}
+
+static char **handle_dump_ifc(char *arg, char **next)
+{
+	dump_ifc = 1;
+	return next;
+}
+
 struct switches {
 	const char *name;
 	char **(*fn)(char *, char **);
@@ -1006,6 +1023,8 @@ static char **handle_long_options(char *arg, char **next)
 	static struct switches cmd[] = {
 		{ "arch", handle_arch, 1 },
 		{ "os",   handle_os, 1 },
+		{ "dump-ifc-size", handle_dump_ifc_size, 1},
+		{ "dump-ifc", handle_dump_ifc },
 		{ "param", handle_param, 1 },
 		{ "version", handle_version },
 		{ NULL, NULL }
