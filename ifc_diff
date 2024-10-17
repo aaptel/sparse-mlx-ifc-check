@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+#
+# IFC diff tool
+#
+# Copyright (C) 2024 Aurelien Aptel <aaptel@nvidia.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+import os
+import re
+import json
+import argparse
+import subprocess
+
+#
+# The dump program needs all the preprocessor flags used to build
+# the C files to work properly. This mainly includes defines (-D) and
+# include paths (-I).
+#
+# These flags can be dumped via the kernel Makefile.
+# For example this commands force the regeneration of main.o
+#
+#   rm -f drivers/net/ethernet/mellanox/mlx5/core/main.o
+#   make V=1 C=1 CHECK="echo XXX" drivers/net/ethernet/mellanox/mlx5/core/main.o 2>&1 | grep 'echo XXX' | sed 's/echo XXX//'
+#
+# The dump tool ignores flags it doesn't understand.
+#
+# The tool will dump a json file containing a dict in the following format:
+#
+# {
+#     "<struct or union name>": {
+#         "size": <byte size>,
+#         "fields": {
+#              "<field 1 name>": {"size": <byte size>, "offset": <offset>"},
+#              "<field 2 name>": {"size": <byte size>, "offset": <offset>"},
+#               ...
+#         }
+#     },
+#     "<struct 2>": {
+#         "size": ...,
+#         "fields": {
+#             ...
+#         }
+#     },
+#     ...
+# }
+
+COMPILE_OPTS = """-D__linux__ -Dlinux -D__STDC__ -Dunix -D__unix__ -Wbitwise -Wno-return-void -Wno-unknown-attribute  -D__x86_64__ --arch=x86 -mlittle-endian -m64 -Wp,-MMD,drivers/net/ethernet/mellanox/mlx5/core/.main.o.d -nostdinc -I./arch/x86/include -I./arch/x86/include/generated  -I./include -I./arch/x86/include/uapi -I./arch/x86/include/generated/uapi -I./include/uapi -I./include/generated/uapi -include ./include/linux/compiler-version.h -include ./include/linux/kconfig.h -include ./include/linux/compiler_types.h -D__KERNEL__ -fmacro-prefix-map=./= -std=gnu11 -fshort-wchar -funsigned-char -fno-common -fno-PIE -fno-strict-aliasing -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -fcf-protection=branch -fno-jump-tables -m64 -falign-jumps=1 -falign-loops=1 -mno-80387 -mno-fp-ret-in-387 -mpreferred-stack-boundary=3 -mskip-rax-setup -mtune=generic -mno-red-zone -mcmodel=kernel -Wno-sign-compare -fno-asynchronous-unwind-tables -fno-delete-null-pointer-checks -O2 -fno-allow-store-data-races -fstack-protector-strong -fno-omit-frame-pointer -fno-optimize-sibling-calls -fno-stack-clash-protection -pg -mrecord-mcount -mfentry -DCC_USING_FENTRY -falign-functions=16 -fno-strict-overflow -fno-stack-check -fconserve-stack -Wall -Wundef -Werror=implicit-function-declaration -Werror=implicit-int -Werror=return-type -Werror=strict-prototypes -Wno-format-security -Wno-trigraphs -Wno-frame-address -Wno-address-of-packed-member -Wmissing-declarations -Wmissing-prototypes -Wframe-larger-than=1024 -Wno-main -Wvla -Wno-pointer-sign -Wcast-function-type -Wno-stringop-overflow -Wno-array-bounds -Wno-alloc-size-larger-than -Wimplicit-fallthrough=5 -Werror=date-time -Werror=incompatible-pointer-types -Werror=designated-init -Wenum-conversion -Wextra -Wunused -Wno-unused-but-set-variable -Wno-unused-const-variable -Wno-packed-not-aligned -Wno-format-overflow -Wno-format-truncation -Wno-stringop-truncation -Wno-override-init -Wno-missing-field-initializers -Wno-type-limits -Wno-shift-negative-value -Wno-maybe-uninitialized -Wno-sign-compare -Wno-unused-parameter -g -gdwarf-5 -Idrivers/net/ethernet/mellanox/mlx5/core  -DMODULE  -DKBUILD_BASENAME='"main"' -DKBUILD_MODNAME='"mlx5_core"' -D__KBUILD_MODNAME=kmod_mlx5_core"""
+LINUX_DIR = "/scratch/aaptel/tcpoffload/linux-git"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Instead of finding a C file to parse that includes each IFC header
+# we try to parse the .h directly.  This solution is simpler but
+# requires to pre-include any header the .h depends on.
+
+# provide u8 typedefs and BIT() macros
+BASIC_INCLUDES = ["include/linux/types.h", "include/vdso/bits.h"]
+
+IFC = [
+    {
+        # mlx5_ifc_vdpa.h depends on mlx5_ifc.h
+        "includes": ["include/linux/mlx5/mlx5_ifc.h"],
+        "file": "include/linux/mlx5/mlx5_ifc_vdpa.h",
+    },
+    {
+        "includes": [],
+        "file": "include/linux/mlx5/mlx5_ifc.h",
+    },
+    {
+        "includes": [],
+        "file": "include/linux/mlx5/mlx5_ifc_fpga.h",
+    },
+]
+
+DUMP_PROG = "/scratch/aaptel/mlx_check/mlx_check"
+
+def main():
+    ap = argparse.ArgumentParser("ifc_diff")
+    ap.add_argument("--linux", help="path to the linux git repo")
+    ap.add_argument("--dump-tool", help="path to the ifc dump tool")
+    ap.add_argument("before", help="the previous commit")
+    ap.add_argument("after", help="the current commit")
+    args = ap.parse_args()
+
+    global DUMP_PROG
+    DUMP_PROG = args.dump_tool
+
+    global LINUX_DIR
+    LINUX_DIR = args.linux
+
+    for f in IFC:
+        git_checkout(f["file"], args.before)
+
+    before, before_warnings = dump_kernel_ifc()
+
+    for f in IFC:
+        git_checkout(f["file"], args.after)
+
+    after, after_warnings = dump_kernel_ifc()
+
+    for f in IFC:
+        git_checkout(f["file"], "HEAD")
+
+    rc_struct = diff_struct(before, after)
+    rc_warn   = diff_warnings(before_warnings, after_warnings)
+    exit(1 if rc_struct or rc_warn else 0)
+
+#
+# Look for invalid differences in struct definitions
+#
+def diff_struct(before, after):
+    rc = 0
+    def err(*args, **kwargs):
+        nonlocal rc
+        print("error:", *args, **kwargs)
+        rc = 1
+
+    for struct in after.keys():
+
+        # only look at structs present in both versions
+        if struct not in before:
+            continue
+
+        b, a = before[struct], after[struct]
+
+        #
+        # check existing structs have not changed sizes
+        #
+        if b["size"] != a["size"]:
+            err(f"struct {struct} size changed {b['size']} => {a['size']}")
+
+        #
+        # check no meaningful fields were removed
+        #
+        removed_fields = set(b["fields"]) - set(a["fields"])
+        for f in removed_fields:
+            if is_reserved_field(f):
+                continue
+            err(f"{struct}.{f} was removed")
+
+        #
+        # check if existing fields have change size or offset
+        #
+        for field in a["fields"]:
+            # only look at fields in both versions
+            if field not in b["fields"]:
+                continue
+            # reserved field can change size
+            if is_reserved_field(field):
+                continue
+
+            boff, aoff = b["fields"][field]["offset"], a["fields"][field]["offset"]
+            bsize, asize = b["fields"][field]["size"], a["fields"][field]["size"]
+
+            if boff != aoff:
+                err(f"{struct}.{field} offset changed {boff} => {aoff}")
+            if bsize != asize:
+                err(f"{struct}.{field} size changed {bsize} => {asize}")
+    return rc
+
+#
+# Look for new warnings
+#
+def diff_warnings(before, after):
+    rc = 0
+    wb = set(before)
+    for a in after:
+        if a not in wb:
+            print("new warning: {a}")
+            rc = 1
+
+    return rc
+
+def is_reserved_field(f):
+    return re.search("^reserved_at_", f) is not None
+
+def git_checkout(fn, commit):
+    subprocess.run(["git", "checkout", commit, "--", fn], cwd=LINUX_DIR)
+
+def dump_kernel_ifc():
+    structs = {}
+    output_file = os.path.join(SCRIPT_DIR, "size.json")
+
+    for run in IFC:
+        inc =  " ".join([f" -include {i} " for i in BASIC_INCLUDES])
+        inc += " ".join([f" -include {i} " for i in run["includes"]])
+
+        if os.path.exists(output_file):
+            os.unlink(output_file)
+
+        cmd = " ".join([
+            DUMP_PROG,
+            COMPILE_OPTS,
+            inc,
+            "--dump-ifc-size="+output_file,
+            run["file"],
+        ])
+
+        r = subprocess.run(cmd, shell=True, cwd=LINUX_DIR, capture_output=True)
+
+        with open(output_file) as f:
+            structs.update(json.load(f))
+
+        os.unlink(output_file)
+
+        # remove line and column numbers from warnings are these are likely
+        # to change with the new version but are not actually new warnings
+        warnings = []
+        for line in r.stderr.decode('utf-8').splitlines():
+            m = re.search(r'(^.+?):\d+:\d+: (.+)', line)
+            if not m:
+                continue
+            warnings.append(f"{m.group(1)}: {m.group(2)}")
+
+    return structs, warnings
+
+if __name__ == "__main__":
+    main()
